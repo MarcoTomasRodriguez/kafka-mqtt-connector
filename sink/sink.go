@@ -2,11 +2,13 @@ package sink
 
 import (
 	"fmt"
+	"github.com/MarcoTomasRodriguez/kafka-mqtt-connector/events"
 	"github.com/confluentinc/confluent-kafka-go/kafka"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	log "github.com/sirupsen/logrus"
 	"os"
 	"strconv"
+	"sync"
 )
 
 // Message stores the information of a MQTT to be later published.
@@ -38,10 +40,15 @@ func handleResolver(message *kafka.Message, mapping Mapping, mqttClient mqtt.Cli
 }
 
 // ExecuteSink configures all sink mappings and gives them an environment of execution.
-func ExecuteSink(mapping Mapping, sinkErrorChan chan error) {
+func ExecuteSink(sinkMapping Mapping, sinkChan chan interface{}, wg *sync.WaitGroup) {
+	// Add this goroutine to the wait group and remove it on termination.
+	wg.Add(1)
+	defer wg.Done()
+
 	// Exit sink if no mappings are defined.
-	if len(mapping) == 0 {
+	if len(sinkMapping) == 0 {
 		log.Warnln("Sink: No mappings are defined. Exiting sink.")
+		sinkChan <- events.ExitEvent{Code: 1}
 		return
 	}
 
@@ -57,16 +64,20 @@ func ExecuteSink(mapping Mapping, sinkErrorChan chan error) {
 		"sasl.mechanism": "PLAIN",
 		"sasl.username": os.Getenv("KAFKA_SASL_USERNAME"),
 		"sasl.password": os.Getenv("KAFKA_SASL_PASSWORD"),
+		"go.events.channel.enable": true,
 	})
 	if err != nil {
-		sinkErrorChan <- err
+		sinkChan <- events.ErrorEvent{Err: err}
 		return
 	}
+
+	// Close kafkaConsumer on exit.
+	defer kafkaConsumer.Close()
 
 	// Convert MQTT_BROKER_PORT to int.
 	mqttPort, err := strconv.Atoi(os.Getenv("MQTT_BROKER_PORT"))
 	if err != nil {
-		sinkErrorChan <- err
+		sinkChan <- events.ErrorEvent{Err: err}
 		return
 	}
 
@@ -86,33 +97,48 @@ func ExecuteSink(mapping Mapping, sinkErrorChan chan error) {
 	// Connect to MQTT broker.
 	mqttClient := mqtt.NewClient(mqttOpts)
 	if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
-		sinkErrorChan <- token.Error()
+		sinkChan <- events.ErrorEvent{Err: token.Error()}
 		return
 	}
 
-	// Get to all topics defined in the mapping.
-	kafkaTopics := make([]string, 0, len(mapping))
-	for topic := range mapping {
+	// Get to all topics defined in the sinkMapping.
+	kafkaTopics := make([]string, 0, len(sinkMapping))
+	for topic := range sinkMapping {
 		kafkaTopics = append(kafkaTopics, topic)
 	}
 
-	// Subscribe to all topics defined in the mapping.
+	// Subscribe to all topics defined in the sinkMapping.
 	err = kafkaConsumer.SubscribeTopics(kafkaTopics, nil)
 	if err != nil {
-		sinkErrorChan <- err
+		sinkChan <- events.ErrorEvent{Err: err}
 		return
 	}
 
-	// Execute mapping's resolver.
+	// Pipe kafka events to a channel.
+	kafkaEventChan := kafkaConsumer.Events()
+
+	// Execute sinkMapping's resolver.
 	for {
-		ev := kafkaConsumer.Poll(0)
-		switch event := ev.(type) {
-		case *kafka.Message:
-			handleResolver(event, mapping, mqttClient)
-		case kafka.Error:
-			sinkErrorChan <- event
-			return
-		default:
+		select {
+		case ev := <- kafkaEventChan:
+			switch kafkaEvent := ev.(type) {
+			case *kafka.Message:
+				handleResolver(kafkaEvent, sinkMapping, mqttClient)
+			case kafka.Error:
+				if kafkaEvent.IsFatal() {
+					sinkChan <- events.ErrorEvent{Err: kafkaEvent}
+					return
+				}
+
+				log.Errorf("Sink MQTT: Non fatal error ocurred: %v", kafkaEvent)
+			default:
+			}
+		case sinkEvent := <-sinkChan:
+			switch sinkEvent.(type) {
+			case events.CancelEvent:
+				sinkChan <- events.ExitEvent{Code: 0}
+				return
+			}
 		}
 	}
 }

@@ -2,11 +2,13 @@ package source
 
 import (
 	"fmt"
+	"github.com/MarcoTomasRodriguez/kafka-mqtt-connector/events"
 	"github.com/confluentinc/confluent-kafka-go/kafka"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	log "github.com/sirupsen/logrus"
 	"os"
 	"strconv"
+	"sync"
 )
 
 // Topic is the MQTT Topic that will trigger the resolver.
@@ -32,10 +34,15 @@ func handleResolver(resolver Resolver, kafkaProducerChan chan *kafka.Message) fu
 }
 
 // ExecuteSource configures all source mappings and gives them an environment of execution.
-func ExecuteSource(mapping Mapping, sourceErrorChan chan error) {
+func ExecuteSource(sourceMapping Mapping, sourceChan chan interface{}, wg *sync.WaitGroup) {
+	// Add this goroutine to the wait group and remove it on termination.
+	wg.Add(1)
+	defer wg.Done()
+
 	// Exit source if no mappings are defined.
-	if len(mapping) == 0 {
+	if len(sourceMapping) == 0 {
 		log.Warnln("Source: No mappings are defined. Exiting source.")
+		sourceChan <- events.ExitEvent{Code: 1}
 		return
 	}
 
@@ -52,9 +59,12 @@ func ExecuteSource(mapping Mapping, sourceErrorChan chan error) {
 		"batch.size": os.Getenv("KAFKA_BATCH_SIZE"),
 	})
 	if err != nil {
-		sourceErrorChan <- err
+		sourceChan <- events.ErrorEvent{Err: err}
 		return
 	}
+
+	// Close kafkaProducer on exit.
+	defer kafkaProducer.Close()
 
 	// kafkaProducerChan is a channel in which every message received is sent to the Kafka cluster.
 	kafkaProducerChan := kafkaProducer.ProduceChannel()
@@ -62,7 +72,7 @@ func ExecuteSource(mapping Mapping, sourceErrorChan chan error) {
 	// Convert MQTT_BROKER_PORT to int.
 	mqttPort, err := strconv.Atoi(os.Getenv("MQTT_BROKER_PORT"))
 	if err != nil {
-		sourceErrorChan <- err
+		sourceChan <- events.ErrorEvent{Err: err}
 		return
 	}
 
@@ -83,18 +93,36 @@ func ExecuteSource(mapping Mapping, sourceErrorChan chan error) {
 	// Connect to MQTT broker.
 	mqttClient := mqtt.NewClient(mqttOpts)
 	if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
-		sourceErrorChan <- token.Error()
+		sourceChan <- events.ErrorEvent{Err: token.Error()}
 		return
 	}
 
 	// Configure all mappings.
-	for key, resolver := range mapping {
+	for key, resolver := range sourceMapping {
 		token := mqttClient.Subscribe(key.Topic, key.QoS, handleResolver(resolver, kafkaProducerChan))
 		if token.Wait() && token.Error() != nil {
 			kafkaProducer.Flush(3000)
-			sourceErrorChan <- token.Error()
+			sourceChan <- events.ErrorEvent{Err: token.Error()}
 			return
 		}
 		log.Infof("Source MQTT: Subscribed to topic: %s with QoS: %v.", key.Topic, key.QoS)
+	}
+
+	for {
+		select {
+		// If the goroutine is cancelled by the user, flush all the Kafka events and exit.
+		case sourceEvent := <-sourceChan:
+			switch sourceEvent.(type) {
+			case events.CancelEvent:
+				unFlushedEvents := kafkaProducer.Flush(3000)
+				if unFlushedEvents > 0 {
+					sourceChan <- events.ExitEvent{Code: 1}
+					return
+				}
+
+				sourceChan <- events.ExitEvent{Code: 0}
+				return
+			}
+		}
 	}
 }
